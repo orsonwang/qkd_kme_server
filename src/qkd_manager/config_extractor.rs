@@ -39,6 +39,12 @@ impl ConfigExtractor {
         let qkd_manager = Arc::clone(&qkd_manager);
         Self::extract_all_keys_from_dir(Arc::clone(&qkd_manager), kme_keys_dir, kme_id, delete_key_files_afterwards).await?;
 
+        // notify-rs invokes this callback from its own thread, which is outside the Tokio
+        // runtime: calling tokio::spawn there panics with "there is no reactor running"
+        // and every key file dropped into the directory at runtime is silently lost.
+        // Grab a runtime handle while still inside the runtime and spawn through it.
+        let runtime_handle = tokio::runtime::Handle::current();
+
         let mut key_dir_watcher_callback = match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
             match res {
                 Ok(event) => {
@@ -53,7 +59,7 @@ impl ConfigExtractor {
                         if Self::check_file_extension_qkd_keys(event_path) {
                             let qkd_manager = Arc::clone(&qkd_manager);
                             let event_path = event_path.to_string();
-                            tokio::spawn(async move {
+                            runtime_handle.spawn(async move {
                                 Self::extract_all_keys_from_file(qkd_manager, &event_path, kme_id, delete_key_files_afterwards).await.map_err(|e|
                                     error!("Error extracting keys from file: {:?}", e)
                                 ).unwrap_or(());
@@ -222,5 +228,40 @@ mod tests {
         let qkd_manager = Arc::new(crate::qkd_manager::QkdManager::new(":memory:", 1, &None).await.unwrap());
         assert!(ConfigExtractor::extract_and_watch_raw_keys_dir(Arc::clone(&qkd_manager), 1, "raw_keys/kme-1-1", false).await.is_ok());
         assert!(ConfigExtractor::extract_and_watch_raw_keys_dir(Arc::clone(&qkd_manager), 1, "unexisting/directory", false).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_watched_dir_imports_key_file_written_at_runtime() {
+        // Regression test: the notify callback used to call `tokio::spawn` from notify-rs'
+        // own thread, panicking with "there is no reactor running". The watcher thread died
+        // and every key file dropped into the directory while running was silently lost.
+        const SAE1_CERT_SERIAL: [u8; 4] = [0x01, 0x02, 0x03, 0x04];
+        const SAE2_CERT_SERIAL: [u8; 4] = [0x05, 0x06, 0x07, 0x08];
+        const TMP_DIR: &'static str = "tests/tmp/watch_runtime_key_file";
+
+        let _ = std::fs::remove_dir_all(TMP_DIR);
+        std::fs::create_dir_all(TMP_DIR).unwrap();
+
+        let qkd_manager = Arc::new(crate::qkd_manager::QkdManager::new(":memory:", 1, &None).await.unwrap());
+        qkd_manager.add_sae(1, 1, &Some(Vec::from(SAE1_CERT_SERIAL))).await.unwrap();
+        qkd_manager.add_sae(2, 1, &Some(Vec::from(SAE2_CERT_SERIAL))).await.unwrap();
+        ConfigExtractor::extract_and_watch_raw_keys_dir(Arc::clone(&qkd_manager), 1, TMP_DIR, false).await.unwrap();
+
+        // Nothing in the directory yet, so no key can be delivered
+        assert!(qkd_manager.get_qkd_keys(2, &Vec::from(SAE1_CERT_SERIAL), RequestedKeyCount::new(1).unwrap()).await.is_err());
+
+        std::fs::write(format!("{}/runtime_key.cor", TMP_DIR), [0x42u8; crate::QKD_KEY_SIZE_BYTES]).unwrap();
+
+        // Import is triggered by the file-close event and completes asynchronously
+        let mut imported = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if qkd_manager.get_qkd_keys(2, &Vec::from(SAE1_CERT_SERIAL), RequestedKeyCount::new(1).unwrap()).await.is_ok() {
+                imported = true;
+                break;
+            }
+        }
+        let _ = std::fs::remove_dir_all(TMP_DIR);
+        assert!(imported, "key file written into the watched directory was never imported");
     }
 }
