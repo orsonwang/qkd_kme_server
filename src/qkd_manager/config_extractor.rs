@@ -230,7 +230,11 @@ mod tests {
         assert!(ConfigExtractor::extract_and_watch_raw_keys_dir(Arc::clone(&qkd_manager), 1, "unexisting/directory", false).await.is_err());
     }
 
+    // Only the inotify backend emits `Access(Close(Write))`, which is the event the watcher
+    // filters on, so a file written at runtime can only ever be picked up on Linux. The fsevent
+    // (macOS), kqueue and windows backends never emit it, so this test cannot pass there.
     #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "watcher only reacts to inotify's Access(Close(Write))")]
     async fn test_watched_dir_imports_key_file_written_at_runtime() {
         // Regression test: the notify callback used to call `tokio::spawn` from notify-rs'
         // own thread, panicking with "there is no reactor running". The watcher thread died
