@@ -4,10 +4,17 @@ use crate::{io_err, KmeId, DEFAULT_SHOULD_IGNORE_SYSTEM_PROXY_INTER_KME, QKD_KEY
 use log::error;
 use notify::event::{AccessKind, AccessMode};
 use notify::{EventKind, RecursiveMode, Watcher};
+use std::collections::HashSet;
 use std::io;
 use std::io::{BufReader, Read};
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// Time between two checks of the size of a new key file
+const KEY_FILE_SIZE_CHECK_INTERVAL: Duration = Duration::from_millis(200);
+/// Maximum number of checks of the size of a new key file
+const KEY_FILE_SIZE_CHECK_COUNT: u32 = 50;
 
 pub(super) struct ConfigExtractor {}
 
@@ -37,7 +44,12 @@ impl ConfigExtractor {
     async fn extract_and_watch_raw_keys_dir(qkd_manager: Arc<QkdManager>, kme_id: KmeId, kme_keys_dir: &str, delete_key_files_afterwards: bool) -> Result<(), io::Error> {
         let mut dir_watchers = qkd_manager.dir_watcher.lock().await;
         let qkd_manager = Arc::clone(&qkd_manager);
-        Self::extract_all_keys_from_dir(Arc::clone(&qkd_manager), kme_keys_dir, kme_id, delete_key_files_afterwards).await?;
+
+        // The files that are already in the database. The watcher must not import them again:
+        // some backends report events for files that existed before the start of the watch.
+        let imported_key_files = Arc::new(Mutex::new(
+            Self::extract_all_keys_from_dir(Arc::clone(&qkd_manager), kme_keys_dir, kme_id, delete_key_files_afterwards).await?
+        ));
 
         // notify-rs invokes this callback from its own thread, which is outside the Tokio
         // runtime: calling tokio::spawn there panics with "there is no reactor running"
@@ -46,31 +58,55 @@ impl ConfigExtractor {
         let runtime_handle = tokio::runtime::Handle::current();
 
         let mut key_dir_watcher_callback = match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-            match res {
-                Ok(event) => {
-                    if let EventKind::Access(AccessKind::Close(AccessMode::Write)) = event.kind {
-                        let event_path = match event.paths[0].to_str() {
-                            None => {
-                                error!("Error converting path to string");
-                                return;
-                            }
-                            Some(p) => p
-                        };
-                        if Self::check_file_extension_qkd_keys(event_path) {
-                            let qkd_manager = Arc::clone(&qkd_manager);
-                            let event_path = event_path.to_string();
-                            runtime_handle.spawn(async move {
-                                Self::extract_all_keys_from_file(qkd_manager, &event_path, kme_id, delete_key_files_afterwards).await.map_err(|e|
-                                    error!("Error extracting keys from file: {:?}", e)
-                                ).unwrap_or(());
-                            });
-                        }
-                    }
-                }
+            let event = match res {
+                Ok(event) => event,
                 Err(e) => {
                     error!("Watch error: {:?}", e);
                     return;
                 }
+            };
+            // Only the inotify backend emits Access(Close(Write)), which tells us that the
+            // writer closed the file. The fsevent, kqueue, windows and poll backends emit
+            // Create and Modify events instead, and kqueue and windows only give
+            // ModifyKind::Any. We accept all of them, then we wait until the file is complete.
+            // Each path is imported one time only, so the extra event kinds are harmless.
+            if !matches!(
+                event.kind,
+                EventKind::Access(AccessKind::Close(AccessMode::Write))
+                    | EventKind::Create(_)
+                    | EventKind::Modify(_)
+            ) {
+                return;
+            }
+            for path in event.paths {
+                match path.to_str() {
+                    None => {
+                        error!("Error converting path to string");
+                        continue;
+                    }
+                    Some(path_as_str) => {
+                        if !Self::check_file_extension_qkd_keys(path_as_str) {
+                            continue;
+                        }
+                    }
+                }
+                if !Self::reserve_key_file(&imported_key_files, &path) {
+                    continue;
+                }
+                let qkd_manager = Arc::clone(&qkd_manager);
+                let imported_key_files = Arc::clone(&imported_key_files);
+                runtime_handle.spawn(async move {
+                    if Self::wait_for_complete_key_file(&path).await {
+                        if let Some(path_as_str) = path.to_str() {
+                            if Self::extract_all_keys_from_file(qkd_manager, path_as_str, kme_id, delete_key_files_afterwards).await.is_ok() {
+                                return;
+                            }
+                            error!("Error extracting keys from file {:?}", path);
+                        }
+                    }
+                    // The import did not occur, thus a later event can try again
+                    Self::free_key_file(&imported_key_files, &path);
+                });
             }
         }) {
             Ok(watcher) => watcher,
@@ -132,7 +168,9 @@ impl ConfigExtractor {
         Ok(())
     }
 
-    async fn extract_all_keys_from_dir(qkd_manager: Arc<QkdManager>, dir_path: &str, other_kme_id: i64, delete_key_files_afterwards: bool) -> Result<(), io::Error> {
+    /// Reads every key file in a directory and returns the paths of the files that it read
+    async fn extract_all_keys_from_dir(qkd_manager: Arc<QkdManager>, dir_path: &str, other_kme_id: i64, delete_key_files_afterwards: bool) -> Result<HashSet<PathBuf>, io::Error> {
+        let mut imported_paths = HashSet::new();
         let paths = std::fs::read_dir(dir_path).map_err(|e|
             io_err(&format!("Cannot read directory: {:?}", e))
         )?;
@@ -145,13 +183,56 @@ impl ConfigExtractor {
                 }
             };
             if path.is_file() {
-                let path = path.to_str().ok_or(io_err("Error converting path to string"))?;
-                if Self::check_file_extension_qkd_keys(path) {
-                    Self::extract_all_keys_from_file(Arc::clone(&qkd_manager), path, other_kme_id, delete_key_files_afterwards).await?;
+                let path_as_str = path.to_str().ok_or(io_err("Error converting path to string"))?;
+                if Self::check_file_extension_qkd_keys(path_as_str) {
+                    Self::extract_all_keys_from_file(Arc::clone(&qkd_manager), path_as_str, other_kme_id, delete_key_files_afterwards).await?;
+                    imported_paths.insert(path.clone());
                 }
             }
         }
-        Ok(())
+        Ok(imported_paths)
+    }
+
+    /// Reserves a path, so that two events cannot import the same file at the same time.
+    /// Returns true if this call reserved the path.
+    fn reserve_key_file(imported_key_files: &Mutex<HashSet<PathBuf>>, path: &Path) -> bool {
+        match imported_key_files.lock() {
+            Ok(mut imported_key_files) => imported_key_files.insert(path.to_path_buf()),
+            Err(e) => {
+                error!("Cannot lock the list of imported key files: {:?}", e);
+                false
+            }
+        }
+    }
+
+    /// Removes a path from the reserved paths
+    fn free_key_file(imported_key_files: &Mutex<HashSet<PathBuf>>, path: &Path) {
+        match imported_key_files.lock() {
+            Ok(mut imported_key_files) => {
+                imported_key_files.remove(path);
+            }
+            Err(e) => error!("Cannot lock the list of imported key files: {:?}", e),
+        }
+    }
+
+    /// Waits until the size of a file is the same in two consecutive checks.
+    /// The fsevent, kqueue, windows and poll backends report a new file before the writer
+    /// closes it. Thus the file can be incomplete when the event arrives.
+    async fn wait_for_complete_key_file(path: &Path) -> bool {
+        let mut previous_size: Option<u64> = None;
+        for _ in 0..KEY_FILE_SIZE_CHECK_COUNT {
+            let size = match std::fs::metadata(path) {
+                Ok(metadata) if metadata.is_file() => metadata.len(),
+                _ => return false,
+            };
+            if size > 0 && previous_size == Some(size) {
+                return true;
+            }
+            previous_size = Some(size);
+            tokio::time::sleep(KEY_FILE_SIZE_CHECK_INTERVAL).await;
+        }
+        error!("The size of the key file {:?} does not become stable, thus it is ignored", path);
+        false
     }
 
     fn check_file_extension_qkd_keys(file_path: &str) -> bool {
@@ -183,6 +264,9 @@ mod tests {
     use crate::qkd_manager::config_extractor::ConfigExtractor;
     use crate::RequestedKeyCount;
     use serial_test::serial;
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -230,11 +314,7 @@ mod tests {
         assert!(ConfigExtractor::extract_and_watch_raw_keys_dir(Arc::clone(&qkd_manager), 1, "unexisting/directory", false).await.is_err());
     }
 
-    // Only the inotify backend emits `Access(Close(Write))`, which is the event the watcher
-    // filters on, so a file written at runtime can only ever be picked up on Linux. The fsevent
-    // (macOS), kqueue and windows backends never emit it, so this test cannot pass there.
     #[tokio::test]
-    #[cfg_attr(not(target_os = "linux"), ignore = "watcher only reacts to inotify's Access(Close(Write))")]
     async fn test_watched_dir_imports_key_file_written_at_runtime() {
         // Regression test: the notify callback used to call `tokio::spawn` from notify-rs'
         // own thread, panicking with "there is no reactor running". The watcher thread died
@@ -258,7 +338,9 @@ mod tests {
 
         // Import is triggered by the file-close event and completes asynchronously
         let mut imported = false;
-        for _ in 0..50 {
+        // The watcher waits for the size of the file to become stable, and the fsevent and
+        // windows backends can report the file some time after the write
+        for _ in 0..150 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             if qkd_manager.get_qkd_keys(2, &Vec::from(SAE1_CERT_SERIAL), RequestedKeyCount::new(1).unwrap()).await.is_ok() {
                 imported = true;
@@ -267,5 +349,45 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(TMP_DIR);
         assert!(imported, "key file written into the watched directory was never imported");
+    }
+
+
+    #[test]
+    fn test_reserve_and_free_key_file() {
+        let imported_key_files = Mutex::new(HashSet::new());
+        let path = PathBuf::from("tests/tmp/a_key_file.cor");
+
+        // The first call reserves the path, the second call must not
+        assert!(ConfigExtractor::reserve_key_file(&imported_key_files, &path));
+        assert!(!ConfigExtractor::reserve_key_file(&imported_key_files, &path));
+
+        // After a free, a new reservation is possible again
+        ConfigExtractor::free_key_file(&imported_key_files, &path);
+        assert!(ConfigExtractor::reserve_key_file(&imported_key_files, &path));
+
+        // A different path is independent
+        let other_path = PathBuf::from("tests/tmp/an_other_key_file.cor");
+        assert!(ConfigExtractor::reserve_key_file(&imported_key_files, &other_path));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_complete_key_file() {
+        const TMP_DIR: &'static str = "tests/tmp/complete_key_file";
+        let _ = std::fs::remove_dir_all(TMP_DIR);
+        std::fs::create_dir_all(TMP_DIR).unwrap();
+
+        // A file that does not change is complete
+        let complete_file = format!("{}/complete.cor", TMP_DIR);
+        std::fs::write(&complete_file, [0x42u8; crate::QKD_KEY_SIZE_BYTES]).unwrap();
+        assert!(ConfigExtractor::wait_for_complete_key_file(Path::new(&complete_file)).await);
+
+        // A file that does not exist is not complete
+        let absent_file = format!("{}/absent.cor", TMP_DIR);
+        assert!(!ConfigExtractor::wait_for_complete_key_file(Path::new(&absent_file)).await);
+
+        // A directory is not a key file
+        assert!(!ConfigExtractor::wait_for_complete_key_file(Path::new(TMP_DIR)).await);
+
+        let _ = std::fs::remove_dir_all(TMP_DIR);
     }
 }
